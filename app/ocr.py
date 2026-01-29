@@ -139,7 +139,7 @@ def parse_invoice(text: str) -> Dict[str, Any]:
         "subtotal": extract_amount(normalized_text, SUBTOTAL_KEYWORDS),
         "tax": extract_amount(normalized_text, TAX_KEYWORDS),
         "total": extract_amount(normalized_text, TOTAL_KEYWORDS),
-        "line_items": extract_line_items(lines, normalized_text)
+        "line_items": extract_line_items(raw_lines, lines, normalized_text)
     }
 
     return invoice
@@ -237,9 +237,15 @@ def extract_amount(text: str, keywords: List[str]) -> Optional[float]:
 # -------------------------
 
 def _is_likely_header_line(line: str) -> bool:
-    lower = line.lower()
+    """Skip only if line looks like a table header row (mostly header keywords)."""
+    lower = line.lower().strip()
     words = re.split(r"[\s\|\t]+", lower)
-    return any(h in w for w in words for h in LINE_ITEM_HEADERS)
+    if not words:
+        return True
+    # Count how many words are (or contain) header keywords
+    header_like = sum(1 for w in words if any(h in w for h in LINE_ITEM_HEADERS))
+    # Skip only if majority of words are header-like (e.g. "Description  Qty  Rate  Amount")
+    return len(words) <= 6 and header_like >= 2
 
 
 def _is_section_header(desc: str) -> bool:
@@ -254,9 +260,65 @@ def _is_section_header(desc: str) -> bool:
     return lower in headers or any(lower == h for h in headers)
 
 
+def _clean_description(raw: str) -> str:
+    """Trim and normalize description for display; keep content that matches invoice."""
+    if not raw:
+        return ""
+    s = re.sub(r"\s+", " ", raw).strip(" \t|:\-–—")
+    return s[:500] if s else ""
+
+
+def _parse_columns_line(line: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse a table row by splitting on 2+ spaces. Trailing numeric columns = qty, rate, amount.
+    Keeps description accurate (first column(s)) instead of stripping numbers from whole line.
+    """
+    # Split by 2+ spaces or tabs to get columns
+    parts = re.split(r"\s{2,}|\t+", line.strip())
+    if len(parts) < 2:
+        return None
+    # Trailing parts that look like numbers (amount, rate, qty)
+    numeric_parts: List[Optional[float]] = []
+    for i in range(len(parts) - 1, -1, -1):
+        val = _parse_amount_from_string(parts[i])
+        if val is not None and val >= 0:
+            numeric_parts.insert(0, val)
+        else:
+            break
+    if not numeric_parts:
+        return None
+    # Description = all non-numeric columns joined
+    desc_end = len(parts) - len(numeric_parts)
+    if desc_end <= 0:
+        return None
+    description = _clean_description(" ".join(parts[:desc_end]))
+    if not description or _is_section_header(description):
+        return None
+    amount = numeric_parts[-1]
+    if len(numeric_parts) >= 3:
+        qty = max(1, int(round(numeric_parts[0])))
+        unit_price = numeric_parts[1]
+    elif len(numeric_parts) == 2:
+        qty = 1
+        unit_price = numeric_parts[0]
+    else:
+        qty = 1
+        unit_price = amount
+    return {
+        "description": description,
+        "quantity": max(1, qty),
+        "unit_price": round(unit_price, 2),
+        "amount": round(amount, 2)
+    }
+
+
 def _parse_table_like_line(line: str) -> Optional[Dict[str, Any]]:
     """Parse a line that looks like: Description   Qty   Rate   Amount (numbers separated by spaces/tabs)."""
-    # Match 2–4 numbers (qty, rate, amount or just amount)
+    # Try column-based first (preserves description from first column(s))
+    col_parsed = _parse_columns_line(line)
+    if col_parsed is not None:
+        return col_parsed
+    # Fallback: match 2–4 numbers and strip them from line for description
     numbers = re.findall(r"[\$₹€]?\s*[\d,]+(?:\.\d{2})?", line)
     if not numbers:
         return None
@@ -264,11 +326,11 @@ def _parse_table_like_line(line: str) -> Optional[Dict[str, Any]]:
     amounts = [a for a in amounts if a is not None]
     if not amounts:
         return None
-    # Last number is usually amount
     amount = amounts[-1]
-    # Remove all amount-like parts from line to get description
     desc_line = re.sub(r"[\$₹€]?\s*[\d,]+(?:\.\d{2})?", " ", line)
-    desc_line = re.sub(r"\s+", " ", desc_line).strip(" \t|:-")
+    description = _clean_description(desc_line)
+    if not description:
+        description = "Item"
     if len(amounts) >= 3:
         qty = max(1, int(round(amounts[0])))
         unit_price = amounts[1]
@@ -278,69 +340,96 @@ def _parse_table_like_line(line: str) -> Optional[Dict[str, Any]]:
     else:
         qty = 1
         unit_price = amount
-    description = desc_line if desc_line else "Item"
     return {
-        "description": description[:500],
+        "description": description,
         "quantity": max(1, qty),
         "unit_price": round(unit_price, 2),
         "amount": round(amount, 2)
     }
 
 
-def extract_line_items(lines: List[str], full_text: str) -> List[Dict[str, Any]]:
+def extract_line_items(
+    raw_lines: List[str], lines: List[str], full_text: str
+) -> List[Dict[str, Any]]:
+    """
+    raw_lines: original lines (spaces preserved) for column-based parsing.
+    lines: normalized (single space) for header/amount checks.
+    """
     items: List[Dict[str, Any]] = []
-    seen = set()
+    seen: set = set()
 
-    for line in lines:
+    for i, line in enumerate(lines):
+        raw = raw_lines[i] if i < len(raw_lines) else line
         if _is_likely_header_line(line):
             continue
-        # 1) Line ending with amount (e.g. "Service Fee    200.00" or "200.00")
-        amount_at_end = re.search(r"([\$₹€]?\s*[\d,]+\.\d{2})\s*$", line)
+        # 1) Column-based: split by 2+ spaces so description = first column(s)
+        parsed_col = _parse_columns_line(raw)
+        if parsed_col and parsed_col["description"]:
+            key = (
+                parsed_col["description"][:80],
+                parsed_col["quantity"],
+                parsed_col["unit_price"],
+                parsed_col["amount"],
+            )
+            if key not in seen:
+                seen.add(key)
+                items.append(parsed_col)
+            continue
+
+        # 2) Line ending with decimal amount (e.g. "Service Fee    200.00")
+        amount_at_end = re.search(r"([\$₹€]?\s*[\d,]+\.\d{2})\s*$", raw)
         if amount_at_end:
             amount = _parse_amount_from_string(amount_at_end.group(1))
             if amount is not None:
-                desc = re.sub(r"[\$₹€]?\s*[\d,]+\.\d{2}\s*$", "", line).strip(" \t:-|")
-                if _is_section_header(desc):
-                    continue
-                qty_match = re.search(r"(\d+)\s*(?:hours|hrs|qty|x|\*)?", line, re.IGNORECASE)
-                qty = int(qty_match.group(1)) if qty_match else 1
-                unit_price = round(amount / qty, 2) if qty else amount
-                key = (desc[:80], qty, unit_price, amount)
-                if key not in seen:
-                    seen.add(key)
-                    items.append({
-                        "description": desc[:500] if desc else "Item",
-                        "quantity": qty,
-                        "unit_price": unit_price,
-                        "amount": round(amount, 2)
-                    })
+                desc = re.sub(r"[\$₹€]?\s*[\d,]+\.\d{2}\s*$", "", raw).strip(" \t:-|")
+                desc = _clean_description(desc)
+                if desc and not _is_section_header(desc):
+                    qty_match = re.search(
+                        r"(\d+)\s*(?:hours|hrs|qty|x|\*)?", raw, re.IGNORECASE
+                    )
+                    qty = int(qty_match.group(1)) if qty_match else 1
+                    unit_price = round(amount / qty, 2) if qty else amount
+                    key = (desc[:80], qty, unit_price, amount)
+                    if key not in seen:
+                        seen.add(key)
+                        items.append({
+                            "description": desc,
+                            "quantity": qty,
+                            "unit_price": unit_price,
+                            "amount": round(amount, 2),
+                        })
             continue
 
-        # 2) Integer amount at end
-        amount_int = re.search(r"([\$₹€]?\s*[\d,]+)\s*$", line)
+        # 3) Integer amount at end
+        amount_int = re.search(r"([\$₹€]?\s*[\d,]+)\s*$", raw)
         if amount_int:
             amount = _parse_amount_from_string(amount_int.group(1))
             if amount is not None and amount > 0:
-                desc = re.sub(r"[\$₹€]?\s*[\d,]+\s*$", "", line).strip(" \t:-|")
-                if len(desc) < 2 or _is_section_header(desc):
-                    continue
-                qty = 1
-                unit_price = amount
-                key = (desc[:80], 1, amount, amount)
-                if key not in seen:
-                    seen.add(key)
-                    items.append({
-                        "description": desc[:500],
-                        "quantity": qty,
-                        "unit_price": round(unit_price, 2),
-                        "amount": round(amount, 2)
-                    })
+                desc = re.sub(r"[\$₹€]?\s*[\d,]+\s*$", "", raw).strip(" \t:-|")
+                desc = _clean_description(desc)
+                if len(desc) >= 2 and not _is_section_header(desc):
+                    qty = 1
+                    unit_price = amount
+                    key = (desc[:80], 1, amount, amount)
+                    if key not in seen:
+                        seen.add(key)
+                        items.append({
+                            "description": desc,
+                            "quantity": qty,
+                            "unit_price": round(unit_price, 2),
+                            "amount": round(amount, 2),
+                        })
             continue
 
-        # 3) Table-like: multiple numbers in one line (Description  Qty  Rate  Amount)
-        parsed = _parse_table_like_line(line)
+        # 4) Table-like fallback: multiple numbers in one line
+        parsed = _parse_table_like_line(raw)
         if parsed and parsed["description"] and not _is_section_header(parsed["description"]):
-            key = (parsed["description"][:80], parsed["quantity"], parsed["unit_price"], parsed["amount"])
+            key = (
+                parsed["description"][:80],
+                parsed["quantity"],
+                parsed["unit_price"],
+                parsed["amount"],
+            )
             if key not in seen:
                 seen.add(key)
                 items.append(parsed)
