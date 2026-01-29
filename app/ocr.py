@@ -8,12 +8,14 @@ import mimetypes
 
 
 # -------------------------
-# OCR EXTRACTION
+# OCR EXTRACTION (English-only for invoice text)
 # -------------------------
+TESSERACT_CONFIG = "-l eng --psm 6"
+
 
 def extract_text_from_image(path: str) -> str:
     image = Image.open(path)
-    return pytesseract.image_to_string(image, lang="eng").strip()
+    return pytesseract.image_to_string(image, lang="eng", config=TESSERACT_CONFIG).strip()
 
 
 def extract_text_from_pdf(path: str) -> str:
@@ -30,7 +32,7 @@ def extract_text_from_scanned_pdf(path: str) -> str:
     pages = convert_from_path(path)
     text = ""
     for page in pages:
-        text += pytesseract.image_to_string(page, lang="eng") + "\n"
+        text += pytesseract.image_to_string(page, lang="eng", config=TESSERACT_CONFIG) + "\n"
     return text.strip()
 
 
@@ -131,8 +133,12 @@ def parse_invoice(text: str) -> Dict[str, Any]:
     normalized_text = _normalize_text(text)
     lines = [_normalize_text(l) for l in raw_lines]
 
+    vendor = extract_vendor(lines, normalized_text)
+    if vendor:
+        vendor = _clean_description(vendor) or None  # Latin-only, matches English invoice
+
     invoice = {
-        "vendor": extract_vendor(lines, normalized_text),
+        "vendor": vendor,
         "invoice_number": extract_invoice_number(normalized_text),
         "invoice_date": extract_invoice_date(normalized_text),
         "currency": detect_currency(text),
@@ -260,11 +266,31 @@ def _is_section_header(desc: str) -> bool:
     return lower in headers or any(lower == h for h in headers)
 
 
+def _keep_latin_for_description(text: str) -> str:
+    """
+    Keep only Latin letters (including accented), digits, and common punctuation.
+    Strips other scripts so English invoices don't get mixed with other-language OCR.
+    """
+    if not text:
+        return ""
+    result = []
+    for c in text:
+        if ord(c) <= 0x7F:
+            result.append(c)  # ASCII
+        elif 0x00C0 <= ord(c) <= 0x024F:
+            result.append(c)  # Latin extended
+        elif c in " \t\n":
+            result.append(c)
+        # else: skip other scripts (Cyrillic, Arabic, Devanagari, etc.)
+    return "".join(result)
+
+
 def _clean_description(raw: str) -> str:
-    """Trim and normalize description for display; keep content that matches invoice."""
+    """Trim and normalize description; keep Latin/English only so descriptions match invoice."""
     if not raw:
         return ""
-    s = re.sub(r"\s+", " ", raw).strip(" \t|:\-–—")
+    s = _keep_latin_for_description(raw)
+    s = re.sub(r"\s+", " ", s).strip(" \t|:\-–—")
     return s[:500] if s else ""
 
 
